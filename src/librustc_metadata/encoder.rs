@@ -38,6 +38,7 @@ use serialize::Encodable;
 use std::cell::RefCell;
 use std::io::prelude::*;
 use std::io::{Cursor, SeekFrom};
+use std::iter;
 use std::rc::Rc;
 use std::u32;
 use syntax::abi;
@@ -1582,6 +1583,44 @@ fn encode_attributes(rbml_w: &mut Encoder, attrs: &[ast::Attribute]) {
     rbml_w.end_tag();
 }
 
+fn encode_meta_item2(mi: &ast::MetaItem) -> Option<meta> {
+    match mi.node {
+      ast::MetaWord(ref name) =>
+          Some(meta::word(word { name: name.to_string() })),
+
+      ast::MetaNameValue(ref n, ref v) => {
+        match v.node {
+          ast::LitStr(ref v, _) =>
+              Some(meta::name_value(name_value {
+                  name:     n.to_string(),
+                  value:    v.to_string(),
+              })),
+          _ => None, /* FIXME (#623): encode other variants */
+        }
+      }
+
+      ast::MetaList(ref name, ref items) =>
+          Some(meta::item_list(
+                  item_list {
+                      name: name.to_string(),
+                      list: items.iter()
+                          .filter_map(|inner_item|
+                                      encode_meta_item2(&**inner_item))
+                          .collect(),
+                  })),
+    }
+}
+
+fn encode_attributes2(attrs: &[ast::Attribute]) -> Vec<cr_attributes> {
+    attrs.iter().map(|attr| {
+        cr_attributes {
+            is_sugared_doc: attr.node.is_sugared_doc as u8,
+            /* XXX: need None instead of unwrap */
+            meta:           encode_meta_item2(&*attr.node.value).unwrap(),
+        }
+    }).collect()
+}
+
 fn encode_unsafety(rbml_w: &mut Encoder, unsafety: hir::Unsafety) {
     let byte: u8 = match unsafety {
         hir::Unsafety::Normal => 0,
@@ -1649,6 +1688,42 @@ fn encode_crate_deps(rbml_w: &mut Encoder, cstore: &cstore::CStore) {
     rbml_w.end_tag();
 }
 
+fn encode_crate_deps2(cstore: &cstore::CStore) -> Vec<crate_deps> {
+    fn get_ordered_deps(cstore: &cstore::CStore)
+                        -> Vec<(CrateNum, Rc<cstore::crate_metadata>)> {
+        // Pull the cnums and name,vers,hash out of cstore
+        let mut deps = Vec::new();
+        cstore.iter_crate_data(|cnum, val| {
+            deps.push((cnum, val.clone()));
+        });
+
+        // Sort by cnum
+        deps.sort_by(|kv1, kv2| kv1.0.cmp(&kv2.0));
+
+        // Sanity-check the crate numbers
+        let mut expected_cnum = 1;
+        for &(n, _) in &deps {
+            assert_eq!(n, expected_cnum);
+            expected_cnum += 1;
+        }
+
+        deps
+    }
+
+    // We're just going to write a list of crate 'name-hash-version's, with
+    // the assumption that they are numbered 1 to n.
+    // FIXME (#2166): This is not nearly enough to support correct versioning
+    // but is enough to get transitive crate dependencies working.
+    get_ordered_deps(cstore).iter().map(|i| {
+        let &(_, ref dep) = i;
+
+        crate_deps {
+            name:               dep.name.to_string(),
+            hash:               decoder::get_crate_hash(dep.data()).to_string(),
+            explicitly_linked:  dep.explicitly_linked.get() as u8,
+        }}).collect()
+}
+
 fn encode_lang_items(ecx: &EncodeContext, rbml_w: &mut Encoder) {
     rbml_w.start_tag(tag_lang_items);
 
@@ -1670,6 +1745,32 @@ fn encode_lang_items(ecx: &EncodeContext, rbml_w: &mut Encoder) {
     rbml_w.end_tag();   // tag_lang_items
 }
 
+fn encode_lang_items2(ecx: &EncodeContext) -> cr_lang_items {
+    cr_lang_items {
+        items: ecx.tcx.lang_items.items()
+            .filter_map(|a| {
+                let (i, &opt_def_id) = a;
+
+                if let Some(def_id) = opt_def_id {
+                    if def_id.is_local() {
+                        Some(items {
+                            id:     i as u32,
+                            index:  def_id.index.as_u32(),
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }).collect(),
+        items_missing: ecx.tcx.lang_items.missing
+            .iter()
+            .map(|i| *i as u32)
+            .collect(),
+    }
+}
+
 fn encode_native_libraries(ecx: &EncodeContext, rbml_w: &mut Encoder) {
     rbml_w.start_tag(tag_native_libraries);
 
@@ -1688,6 +1789,21 @@ fn encode_native_libraries(ecx: &EncodeContext, rbml_w: &mut Encoder) {
     rbml_w.end_tag();
 }
 
+fn encode_native_libraries2(ecx: &EncodeContext) -> Vec<native_libraries> {
+    ecx.tcx.sess.cstore.used_libraries().iter().filter_map(|i| {
+        let &(ref lib, kind) = i;
+
+        match kind {
+            cstore::NativeStatic => None, // these libraries are not propagated
+            cstore::NativeFramework | cstore::NativeUnknown =>
+                Some(native_libraries {
+                    kind:   kind as u32,
+                    name:   lib.clone(),
+                }),
+        }
+    }).collect()
+}
+
 fn encode_plugin_registrar_fn(ecx: &EncodeContext, rbml_w: &mut Encoder) {
     match ecx.tcx.sess.plugin_registrar_fn.get() {
         Some(id) => {
@@ -1696,6 +1812,11 @@ fn encode_plugin_registrar_fn(ecx: &EncodeContext, rbml_w: &mut Encoder) {
         }
         None => {}
     }
+}
+
+fn encode_plugin_registrar_fn2(ecx: &EncodeContext) -> Option<u32> {
+    ecx.tcx.sess.plugin_registrar_fn.get().map(|id|
+                ecx.tcx.map.local_def_id(id).index.as_u32())
 }
 
 fn encode_codemap(ecx: &EncodeContext, rbml_w: &mut Encoder) {
@@ -1720,6 +1841,57 @@ fn encode_codemap(ecx: &EncodeContext, rbml_w: &mut Encoder) {
     rbml_w.end_tag();
 }
 
+use syntax::codemap::Pos;
+
+fn encode_codemap2(ecx: &EncodeContext) -> Vec<cr_codemap> {
+    ecx.tcx.sess.codemap().files.borrow().iter().filter_map(|filemap| {
+        let lines = filemap.lines.borrow();
+
+        if lines.is_empty() || filemap.is_imported() {
+            // No need to export empty filemaps, as they can't contain spans
+            // that need translation.
+            // Also no need to re-export imported filemaps, as any downstream
+            // crate will import them from their original source.
+            None
+        } else {
+            Some(cr_codemap {
+                name:           filemap.name.clone(),
+                start_pos:      filemap.start_pos.0,
+                end_pos:        filemap.end_pos.0,
+                nr_lines:       lines.len() as u32,
+                lines:          if lines.len() != 0 {
+                    let max_line_length = lines.windows(2)
+                        .map(|w| (w[1] - w[0]).to_usize())
+                        .max()
+                        .unwrap_or(0);
+
+                    Some(lines {
+                        bytes_per_diff: match max_line_length {
+                                0 ... 0xFF => 1,
+                                0x100 ... 0xFFFF => 2,
+                                _ => 4,
+                            } as u8,
+                        lines:          iter::once(lines[0].0)
+                            .chain((&lines[..])
+                                   .windows(2)
+                                   .map(|w| (w[1] - w[0]).0))
+                            .collect(),
+                    })
+                } else {
+                    None
+                },
+                multibyte_chars: filemap.multibyte_chars
+                    .borrow()
+                    .iter()
+                    .map(|i| multibyte_chars {
+                        pos:    i.pos.0,
+                        bytes:  i.bytes as u32,
+                    }).collect(),
+            })
+        }
+    }).collect()
+}
+
 /// Serialize the text of the exported macros
 fn encode_macro_defs(rbml_w: &mut Encoder,
                      krate: &hir::Crate) {
@@ -1736,6 +1908,18 @@ fn encode_macro_defs(rbml_w: &mut Encoder,
         rbml_w.end_tag();
     }
     rbml_w.end_tag();
+}
+
+fn encode_macro_defs2(krate: &hir::Crate) -> Vec<macro_defs> {
+    krate.exported_macros
+        .iter()
+        .map(|def| {
+            macro_defs {
+                name:   def.name.as_str().to_string(),
+                attrs:  encode_attributes2(&def.attrs),
+                body:   ::syntax::print::pprust::tts_to_string(&def.body),
+            }
+        }).collect()
 }
 
 fn encode_struct_field_attrs(ecx: &EncodeContext,
@@ -1869,8 +2053,7 @@ fn encode_crate_triple(rbml_w: &mut Encoder, triple: &str) {
     rbml_w.wr_tagged_str(tag_crate_triple, triple);
 }
 
-fn encode_dylib_dependency_formats(rbml_w: &mut Encoder, ecx: &EncodeContext) {
-    let tag = tag_dylib_dependency_formats;
+fn dylib_dependency_formats(ecx: &EncodeContext) -> String {
     match ecx.tcx.sess.dependency_formats.borrow().get(&config::CrateTypeDylib) {
         Some(arr) => {
             let s = arr.iter().enumerate().filter_map(|(i, slot)| {
@@ -1882,12 +2065,17 @@ fn encode_dylib_dependency_formats(rbml_w: &mut Encoder, ecx: &EncodeContext) {
                 };
                 Some(format!("{}:{}", i + 1, kind))
             }).collect::<Vec<String>>();
-            rbml_w.wr_tagged_str(tag, &s.join(","));
+            s.join(",")
         }
         None => {
-            rbml_w.wr_tagged_str(tag, "");
+            "".to_string()
         }
     }
+}
+
+fn encode_dylib_dependency_formats(rbml_w: &mut Encoder, ecx: &EncodeContext) {
+    let tag = tag_dylib_dependency_formats;
+    rbml_w.wr_tagged_str(tag, &dylib_dependency_formats(ecx)[..]);
 }
 
 // NB: Increment this as you change the metadata encoding version.
@@ -1935,6 +2123,79 @@ pub fn encode_metadata(parms: EncodeParams, krate: &hir::Crate) -> Vec<u8> {
     let mut v = wr.into_inner();
     v.truncate(metalen);
     assert_eq!(v.len(), metalen);
+
+    let v2 = encode_metadata2(&ecx, krate);
+    if v != v2 {
+        use rbml;
+
+        let differing_byte =
+            v.iter().zip(v2.iter()).position(|i| {
+                let (vi, v2i) = i;
+                *vi != *v2i
+            }).expect(&format!("equal up to end of v2 ({}/{} bytes)",
+                               v2.len(), v.len())[..]);
+
+        println!("new differs from old at byte {}, new len {} old len {}",
+                 differing_byte, v2.len(), v.len());
+
+        let d1 = rbml::Doc::new(&v[..]);
+        let d2 = rbml::Doc::new(&v2[..]);
+
+        fn check_recurse(path: &str, d1: rbml::Doc, d2: rbml::Doc) {
+            let mut i1 = rbml::reader::docs(d1);
+            let mut i2 = rbml::reader::docs(d2);
+            let mut nr = 0;
+
+            loop {
+                match (i1.next(), i2.next()) {
+                    (Some((t1, c1)), Some((t2, c2))) => {
+                        if t1 != t2 {
+                            panic!("{}: wanted tag 0x{:x} got 0x{:x}",
+                                   path, t1, t2);
+                        }
+
+                        if c1.data[c1.start..c1.end] !=
+                           c2.data[c2.start..c2.end] {
+                            let path = if path != "" {
+                                format!("{}.0x{:x}", path, t1)
+                            } else {
+                                format!("0x{:x}", t1)
+                            };
+                            check_recurse(&path[..], c1, c2);
+                            panic!("{}: data different", path);
+                        }
+                    }
+
+                    (None, Some((t2, c2))) => {
+                        panic!("{}: extra tag 0x{:x} len {}",
+                               path, t2, c2.end - c2.start);
+                    }
+
+                    (Some((t1, c1)), None) => {
+                        panic!("{} + {}: missing tag 0x{:x} len {} data {:?}",
+                               path, nr, t1, c1.end - c1.start,
+                               &c1.data[c1.start..c1.end]);
+                    }
+
+                    (None, None) => {
+                        break;
+                    }
+                }
+
+                nr += 1;
+            }
+        }
+
+        if d1.data[d1.start..d1.end] ==
+           d2.data[d2.start..d2.end] {
+            panic!("data different but docs not different");
+        }
+
+        check_recurse("", d1, d2);
+
+        panic!("shouldn't have gotten here:\nnew differs from old at byte {}, new len {} old len {}",
+               differing_byte, v2.len(), v.len());
+    }
 
     // And here we run into yet another obscure archive bug: in which metadata
     // loaded from archives may have trailing garbage bytes. Awhile back one of
@@ -2090,6 +2351,38 @@ fn encode_metadata_inner(rbml_w: &mut Encoder,
         println!("            zero bytes: {}", stats.zero_bytes);
         println!("           total bytes: {}", stats.total_bytes);
     }
+}
+
+fn encode_metadata2(ecx: &EncodeContext,
+                    krate: &hir::Crate) -> Vec<u8> {
+    let mut wr = Cursor::new(Vec::new());
+    {
+        let mut rbml_w = Encoder::new(&mut wr);
+
+        tls::enter_encoding_context(ecx, &mut rbml_w, |_, rbml_w| {
+            encode_crate_metadata(&CrateMetadata {
+                rustc_version:              rustc_version(),
+                crate_name:                 ecx.link_meta.crate_name.clone(),
+                crate_triple:               ecx.tcx.sess.opts.target_triple.clone(),
+                crate_hash:                 ecx.link_meta.crate_hash.to_string(),
+                dylib_dependency_formats:   dylib_dependency_formats(ecx),
+                cr_attributes:              encode_attributes2(&krate.attrs),
+                crate_deps:                 encode_crate_deps2(ecx.cstore),
+                cr_lang_items:              encode_lang_items2(ecx),
+                native_libraries:           encode_native_libraries2(ecx),
+                plugin_registrar_fn:        encode_plugin_registrar_fn2(ecx),
+                cr_codemap:                 encode_codemap2(ecx),
+                macro_defs:                 encode_macro_defs2(krate),
+            }, rbml_w)
+        });
+    }
+
+    // RBML compacts the encoded bytes whenever appropriate,
+    // so there are some garbages left after the end of the data.
+    let metalen = wr.seek(SeekFrom::Current(0)).unwrap() as usize;
+    let mut v = wr.into_inner();
+    v.truncate(metalen);
+    v
 }
 
 // Get the encoded string for a type

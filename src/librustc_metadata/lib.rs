@@ -25,6 +25,7 @@
 #![feature(rustc_private)]
 #![feature(staged_api)]
 #![feature(time2)]
+#![feature(type_macros)]
 
 #[macro_use] extern crate log;
 #[macro_use] extern crate syntax;

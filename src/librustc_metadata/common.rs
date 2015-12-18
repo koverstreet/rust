@@ -9,6 +9,7 @@
 // except according to those terms.
 
 #![allow(non_camel_case_types, non_upper_case_globals)]
+#![allow(unused_must_use)] // everything is just a MemWriter, can't fail
 
 pub use self::astencode_tag::*;
 
@@ -243,4 +244,426 @@ pub fn rustc_version() -> String {
         "rustc {}",
         option_env!("CFG_VERSION").unwrap_or("unknown version")
     )
+}
+
+// Given a field (field: tag => type), returns the type - where the type might
+// be a type literal, an array, or an anonymous struct
+macro_rules! crate_metadata_field_type {
+    ( $field:ident: S $block:tt) => {
+        $field
+    };
+
+    ( $field:ident: E $block:tt) => {
+        $field
+    };
+
+    ( $field:ident: A [ $subtag:expr => $subtyp:tt $subtyv:tt ] ) => {
+        Vec<crate_metadata_field_type!($field: $subtyp $subtyv)>
+    };
+
+    ( $field:ident: V [ $subtag:expr => $subtyp:tt $subtyv:tt ] ) => {
+        Vec<crate_metadata_field_type!($field: $subtyp $subtyv)>
+    };
+
+    ( $field:ident: O [ $subtyp:tt $subtyv:tt ] ) => {
+        Option<crate_metadata_field_type!($field: $subtyp $subtyv)>
+    };
+
+    ( $field:ident: P $typ:ty ) => { $typ };
+}
+
+// Declare types for the crate metadata:
+// Argument is of the form name: tagnr => type - where type might be an array
+// or an anonymous (nested) struct
+//
+// Tricky bit: Since rust doesn't have anonymous structs, when the type
+// argument is a nested struct we have to first recurse, declaring types for
+// all the children, then declare the outer struct.
+macro_rules! crate_metadata_decltypes {
+    ( $field:ident: $tag:expr => S {
+        $($subfield:ident: $subtag:expr => $subtyp:tt $subtyv:tt,)*
+    } ) => {
+        $(
+            crate_metadata_decltypes!($subfield: $subtag => $subtyp $subtyv);
+        )*
+
+        pub struct $field {
+            $(
+                pub $subfield: crate_metadata_field_type!($subfield: $subtyp $subtyv),
+            )*
+        }
+    };
+
+    ( $field:ident: $tag:expr => E {
+        $($subfield:ident: $subtag:expr => $subtyp:tt $subtyv:tt,)*
+    } ) => {
+        $(
+            crate_metadata_decltypes!($subfield: $subtag => $subtyp $subtyv);
+        )*
+
+        pub enum $field {
+            $(
+                $subfield(crate_metadata_field_type!($subfield: $subtyp $subtyv)),
+            )*
+        }
+    };
+
+    ( $field:ident: $tag:expr => A [
+      $subtag:expr => $subtyp:tt $subtyv:tt
+    ] ) => {
+        crate_metadata_decltypes!($field: $tag => $subtyp $subtyv);
+    };
+
+    ( $field:ident: $tag:expr => V [
+      $subtag:expr => $subtyp:tt $subtyv:tt
+    ] ) => {
+        crate_metadata_decltypes!($field: $tag => $subtyp $subtyv);
+    };
+
+    ( $field:ident: $tag:expr => O [ $subtyp:tt $subtyv:tt
+    ] ) => {
+        crate_metadata_decltypes!($field: $tag => $subtyp $subtyv);
+    };
+
+    ( $field:ident: $tag:expr => P $typ:ty ) => {};
+}
+
+macro_rules! crate_metadata_type {
+    ($($field:ident: $tag:expr => $typ:tt $tyv:tt,)*) => {
+        crate_metadata_decltypes!(CrateMetadata: 0 => S {
+            $($field: $tag => $typ $tyv,)*
+        });
+    };
+}
+
+use std::usize;
+const NOTAG: usize = usize::MAX;
+
+use rbml;
+use rbml::EbmlEncoderTag::*;
+use serialize::Encoder;         // emit_u32 etc.
+
+trait MyFancyEncode {
+    fn enc(&self, rbml_w: &mut rbml::writer::Encoder);
+}
+
+macro_rules! crate_metadata_encode_field {
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => S {
+        $($subfield:ident: $subtag:expr => $subtyp:tt $subtyv:tt,)*
+    }) => { {
+        impl MyFancyEncode for $fieldtype {
+            fn enc(&self, rbml_w: &mut rbml::writer::Encoder) {
+                if $tag as usize != NOTAG {
+                    rbml_w.start_tag($tag as usize);
+                }
+
+                $(
+                    crate_metadata_encode_field!($subfield,
+                                                 &self.$subfield,
+                                                 rbml_w,
+                                                 $subtag => $subtyp $subtyv);
+                )*
+
+                if $tag as usize != NOTAG {
+                    rbml_w.end_tag();
+                }
+            }
+        }
+
+        $field.enc($rbml_w);
+    } };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => E {
+        $($subfield:ident: $subtag:expr => $subtyp:tt $subtyv:tt,)*
+    }) => { {
+        impl MyFancyEncode for $fieldtype {
+            fn enc(&self, rbml_w: &mut rbml::writer::Encoder) {
+                if $tag as usize != NOTAG {
+                    rbml_w.start_tag($tag);
+                }
+
+                match self { $(
+                    &$fieldtype::$subfield(ref v) =>
+                        crate_metadata_encode_field!($subfield,
+                                            v, rbml_w,
+                                            $subtag => $subtyp $subtyv),
+                )* }
+
+                if $tag as usize != NOTAG {
+                    rbml_w.end_tag();
+                }
+            }
+        }
+
+        $field.enc($rbml_w);
+    } };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => A [
+        $subtag:expr => $subtyp:tt $subtyv:tt
+    ]) => { {
+        if $tag as usize != NOTAG {
+            $rbml_w.start_tag($tag as usize);
+        }
+
+        for i in $field.iter() {
+            crate_metadata_encode_field!($fieldtype, i, $rbml_w,
+                                         $subtag => $subtyp $subtyv);
+        }
+
+        if $tag as usize != NOTAG {
+            $rbml_w.end_tag();
+        }
+    } };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => V [
+        $subtag:expr => $subtyp:tt $subtyv:tt
+    ]) => { {
+        // we can't emulate .emit_seq() due to relevant methods being private:
+        assert!($tag as usize == EsVec as usize);
+
+        $rbml_w.emit_seq($field.len(), |rbml_w| {
+            for i in $field.iter() {
+                crate_metadata_encode_field!($fieldtype, i, rbml_w,
+                                             $subtag => $subtyp $subtyv);
+            }
+            Ok(())
+        })
+    } };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => O [
+        $subtyp:tt $subtyv:tt
+    ]) => { {
+        match *$field {
+            Some(ref v) => {
+                crate_metadata_encode_field!($fieldtype, v,
+                                             $rbml_w,
+                                             $tag => $subtyp $subtyv);
+            }
+            None    => (),
+        }
+    } };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => P str) => {
+        $rbml_w.wr_tagged_str($tag as usize, $field);
+    };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => P String) => {
+        $rbml_w.wr_tagged_str($tag as usize, &$field[..]);
+    };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => P u64) => {
+        if $tag as usize != EsU64 as usize {
+            $rbml_w.wr_tagged_u64($tag as usize, *$field);
+        } else {
+            $rbml_w.emit_u64(*$field);
+        }
+    };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => P u32) => {
+        if $tag as usize != EsU32 as usize {
+            $rbml_w.wr_tagged_u32($tag as usize, *$field);
+        } else {
+            $rbml_w.emit_u32(*$field);
+        }
+    };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => P u16) => {
+        if $tag as usize != EsU16 as usize {
+            $rbml_w.wr_tagged_u16($tag as usize, *$field);
+        } else {
+            $rbml_w.emit_u16(*$field);
+        }
+    };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => P u8) => {
+        if $tag as usize != EsU8 as usize {
+            $rbml_w.wr_tagged_u8($tag as usize, *$field);
+        } else {
+            $rbml_w.emit_u8(*$field);
+        }
+    };
+
+    ($fieldtype:ident, $field:expr, $rbml_w:ident, $tag:expr => P $typ:ty) => {
+        $field.enc($rbml_w);
+    };
+}
+
+macro_rules! crate_metadata_encoder {
+    ($($field:ident: $tag:expr => $typ:tt $tyv:tt,)*) => {
+        pub fn encode_crate_metadata(krate: &CrateMetadata,
+                                     rbml_w: &mut rbml::writer::Encoder) {
+            $(
+                crate_metadata_encode_field!($field, &krate.$field, rbml_w,
+                                             $tag => $typ $tyv);
+            )*
+        }
+    };
+}
+
+macro_rules! crate_metadata_decoder {
+    ($($field:ident: $tag:expr => $typ:tt,)*) => {
+        pub struct CrateMetadataDecoder<'a> {
+            data: &'a [u8]
+        }
+
+        impl<'a> CrateMetadataDecoder<'a> {
+            $(
+                pub fn $field(&self) -> Option<$typ> {
+                    rbml::reader::maybe_get_doc(rbml::Doc::new(self.data),
+                                                $tag).map(|s| s.as_str())
+                }
+            )*
+        }
+    };
+}
+
+macro_rules! crate_metadata_schema {
+    ($($field:ident: $tag:expr => $typ:tt $tyv:tt,)*) => {
+        crate_metadata_type!    { $($field: $tag => $typ $tyv ,)* }
+        crate_metadata_encoder! { $($field: $tag => $typ $tyv ,)* }
+        //crate_metadata_decoder! { $($field: $tag => $typ $tyv ,)* }
+    };
+}
+
+/* XXX: use &str instead of String */
+/* XXX: instead of taking vecs, take vecs or something to work lazily */
+/* XXX: need token pasting */
+/* XXX: hide everything (types!) behind a mod */
+
+crate_metadata_schema! {
+    rustc_version:              0x10f => P String,
+    crate_name:                 0x104 => P String,
+    crate_triple:               0x105 => P String,
+    crate_hash:                 0x103 => P String,
+    dylib_dependency_formats:   0x106 => P String,
+
+    cr_attributes:              0x101 => A [
+                                0x32  => S {
+        is_sugared_doc:         0x8c  => P u8,
+        meta:                   NOTAG => E {
+            word:               0x33  => S {
+                name:           0x30  => P String,
+            },
+
+            name_value:         0x2f  => S {
+                name:           0x30  => P String,
+                value:          0x31  => P String,
+            },
+
+            item_list:          0x34  => S {
+                name:           0x30  => P String,
+                list:           NOTAG => A [
+                                NOTAG => P meta
+                ],
+            },
+
+            /* XXX: need None */
+        },
+    }],
+
+    crate_deps:                 0x102 => A [
+                                0x35  => S {
+        name:                   0x36  => P String,
+        hash:                   0x37  => P String,
+        explicitly_linked:      0x38  => P u8,
+    }],
+
+    cr_lang_items:              0x107 => S {
+        items:                  NOTAG => A [
+                                0x73  => S {
+            id:                 0x74  => P u32,
+            index:              0x75  => P u32,
+        }],
+
+
+        items_missing:          NOTAG => A [
+                                0x76  => P u32
+        ],
+    },
+
+    native_libraries:           0x10a => A [
+                                0x82  => S {
+        kind:                   0x84  => P u32,
+        name:                   0x84  => P String,
+    }],
+
+    plugin_registrar_fn:        0x10b => O [
+                                         P u32
+    ],
+
+    cr_codemap:                 0xa1  => A [
+                                0xa2  => S {
+        name:                   EsStr => P String,
+        start_pos:              EsU32 => P u32,
+        end_pos:                EsU32 => P u32,
+        nr_lines:               EsU32 => P u32,
+        lines:                  NOTAG => O [
+                                         S {
+                /*
+                 * this field is pointless - rbml always encodes each integer
+                 * as small as possible
+                 */
+                bytes_per_diff: EsU8  => P u8,
+                lines:          NOTAG => A [
+                                EsU32 => P u32
+                ],
+            }
+        ],
+        /* also, why are line offsets in here at all? they're useless without
+         * the original source, but if we've got the original source we can
+         * reparse that
+         */
+
+        multibyte_chars:        EsVec => V [
+                                EsVecElt => S {
+            pos:                EsU32 => P u32,
+            bytes:              EsU32 => P u32,
+        }],
+    }],
+
+    macro_defs:                 0x10e => A [
+                                0x9e  => S {
+        name:                   0x20  => P String,
+        attrs:                  0x101 => A [
+                                0x32  => P cr_attributes
+        ],
+        body:                   0x9f  => P String,
+    }],
+
+    /*
+    impls:                      0x109 => A [
+                                0x7d  => S {
+            def_id:             0x21  => P u64,
+            trait_impls:        NOTAG => A [
+                                0x7e  => P u64,
+            ],
+        },
+    ],
+
+    misc_info:                  0x108 => S {
+        crate_items:            0x7c  => A [
+            mod_child:          0x7b  => P u64,
+        ],
+
+        reexports:              NOTAG => A [
+                                0x46  => S {
+            def_id:             0x47  => P u64,
+            name:               0x48  => P String,
+        }],
+    }
+
+    reachable_symbols:          0x10c => A [
+                                0x87  => P u32,
+    ],
+
+    items:                      0x100 => S {
+        data:                   0x22  => S {
+            data_item:          0x23  => S {
+                def_id:         0x21  => P u64,
+                def_key:        0x2c  => S {
+                },
+            },
+        },
+    },
+    */
 }
